@@ -1,13 +1,14 @@
 """Streaming tools related to the HDF5 format"""
-from typing import Union, Dict, Optional, List
+from typing import Union, Dict, Optional, List, Iterable
 from contextlib import AbstractContextManager
 from dataclasses import field, dataclass
 from pathlib import Path
 import logging
+import warnings
 
 import numpy as np
 import pandas as pd
-from tables import File, Table, Filters
+from tables import File, Group, Table, Filters
 
 from battdat.io.hdf import write_df_to_table
 from battdat.schemas.column import ColumnSchema, RawData
@@ -37,13 +38,15 @@ class HDF5Writer(AbstractContextManager):
     complib: str = 'zlib'
     """Compression algorithm. Consult :func:`~pandas.read_hdf` for available options. Ignored if data table already exists"""
     key: str = ''
-    """Name of the root group in which to store the data. Ignored if :attr:`hdf5_output` is a ``File``."""
+    """Name of an existing group in which to store the data"""
     buffer_size: int = 32768
     """Number of rows to collect in memory before writing to disk"""
 
     # State used only while in writing mode
     _file: Optional[File] = None
     """Handle to an open file"""
+    _group: Optional[Group] = None
+    """Group in which to store the data"""
     _dtype: Optional[np.dtype] = None
     """Dtype of records to be written"""
     _table: Optional[Table] = None
@@ -53,34 +56,64 @@ class HDF5Writer(AbstractContextManager):
 
     def __enter__(self):
         self._write_buffer = list()
+        owns_file = not isinstance(self.hdf5_output, File)
+        entered = False
 
-        # Open the store, if needed
-        if isinstance(self.hdf5_output, File):
-            self._file = self.hdf5_output
-        else:
-            self._file = File(
-                self.hdf5_output,
-                root_uep='/' + self.key,
-                mode=self.write_mode
-            )
+        try:
+            # Open the store, if needed
+            if owns_file:
+                self._file = File(
+                    self.hdf5_output,
+                    mode=self.write_mode
+                )
+            else:
+                self._file = self.hdf5_output
 
-        # Write metadata to the store's root's attributes
-        root = self._file.root
-        root._v_attrs.metadata = self.metadata.model_dump_json(exclude_none=True)
-        root._v_attrs.json_schema = self.metadata.model_json_schema()
-        root._v_attrs.battdat_version = __version__
+            key = self.key.strip('/')
+            self._group = self._file.get_node('/' + key) if key else self._file.root
 
-        # Get the table if it exists already
-        if 'raw_data' in root:
-            self._table = root['raw_data']
-        return self
+            # Write metadata to the file's root attributes
+            root = self._file.root
+            metadata_json = self.metadata.model_dump_json(exclude_none=True)
+            if 'metadata' in root._v_attrs:
+                existing_json = root._f_getattr('metadata')
+                try:
+                    metadata_differs = BatteryMetadata.model_validate_json(existing_json) != self.metadata
+                except ValueError:
+                    metadata_differs = True
+                if metadata_differs:
+                    warnings.warn('Metadata already in HDF5 differs from new metadata')
+            root._v_attrs.metadata = metadata_json
+            root._v_attrs.json_schema = self.metadata.model_json_schema()
+            root._v_attrs.battdat_version = __version__
+
+            # Get the table if it exists already
+            if 'raw_data' in self._group:
+                self._table = self._group['raw_data']
+            entered = True
+            return self
+        finally:
+            if not entered:
+                try:
+                    if owns_file and self._file is not None:
+                        self._file.close()
+                finally:
+                    if not owns_file or self._file is None or not self._file.isopen:
+                        self._table = self._group = self._file = self._write_buffer = None
 
     def __exit__(self, exc_type, exc_val, exc_tb):
-        if len(self._write_buffer) > 0:  # Ensure last rows are written
-            self.flush()
-        if not isinstance(self.hdf5_output, File):  # Close file if a path was provided
-            self._file.close()
-        self._table = self._file = self._write_buffer = None
+        owns_file = not isinstance(self.hdf5_output, File)
+        try:
+            if len(self._write_buffer) > 0:  # Ensure last rows are written
+                self.flush()
+        finally:
+            try:
+                if owns_file and self._file is not None:
+                    self._file.close()
+            finally:
+                if not owns_file or self._file is None or not self._file.isopen:
+                    self._table = self._group = self._file = self._write_buffer = None
+        return False
 
     def write_row(self, row: Dict[str, Union[str, float, int]]) -> int:
         """Add a row to the data file
@@ -90,10 +123,22 @@ class HDF5Writer(AbstractContextManager):
         Returns:
             Number of rows written to file. Writes only occur when a write buffer has filled
         """
-        self._write_buffer.append(row.copy())
-        if len(self._write_buffer) >= self.buffer_size:
-            return self.flush()
-        return 0
+        return self.write_rows((row,))
+
+    def write_rows(self, rows: Iterable[Dict[str, Union[str, float, int]]]) -> int:
+        """Add multiple rows to the data file
+
+        Args:
+            rows: Rows to be added to the HDF5 file
+        Returns:
+            Number of rows written to file. Writes only occur when a write buffer has filled
+        """
+        written = 0
+        for row in rows:
+            self._write_buffer.append(row.copy())
+            if len(self._write_buffer) >= self.buffer_size:
+                written += self.flush()
+        return written
 
     def flush(self) -> int:
         """Write the current row buffer to the file
@@ -106,7 +151,7 @@ class HDF5Writer(AbstractContextManager):
             # Make the table the first time
             filters = Filters(complevel=self.complevel, complib=self.complib)
             df = pd.DataFrame(self._write_buffer)
-            self._table = write_df_to_table(self._file, self._file.root, name='raw_data', filters=filters, df=df)
+            self._table = write_df_to_table(self._file, self._group, name='raw_data', filters=filters, df=df)
 
             # Store the metadata
             self._table.attrs.metadata = self.schema.model_dump_json()

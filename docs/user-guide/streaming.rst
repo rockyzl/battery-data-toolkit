@@ -61,4 +61,22 @@ then opening it via Python's ``with`` syntax.
         for time, current, voltage in data_stream:
             writer.write_row({'test_time': time, 'current': current, 'voltage': voltage})
 
+Multiple rows can also be added from any iterable of dictionaries using
+:meth:`~battdat.streaming.hdf5.HDF5Writer.write_rows`.
+Pandas ``DataFrames`` can be converted with ``frame.to_dict(orient='records')`` before writing.
+The return value is the number of rows actually flushed, which can include rows buffered by an earlier call.
+When writing to an already-open :class:`tables.File`, use ``key`` to select an existing group.
+
+.. code-block:: python
+
+    from tables import File
+
+    with File('streamed.h5', mode='a') as hdf5_file:
+        hdf5_file.create_group('/', 'cell_1')
+        with HDF5Writer(hdf5_file, key='cell_1', metadata=metadata) as writer:
+            writer.write_rows([
+                {'test_time': 0, 'current': 0.5, 'voltage': 3.2},
+                {'test_time': 1, 'current': 0.5, 'voltage': 3.3},
+            ])
+
 The writer only writes to disk after enough rows are collected or the end of a data stream is signaled by exiting the ``with`` block.

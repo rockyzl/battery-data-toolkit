@@ -1,14 +1,16 @@
 """Evaluate streaming reads from files"""
 from itertools import zip_longest
 from pathlib import Path
+import warnings
 
 import numpy as np
-from tables import File
-from pytest import fixture, mark, raises
+from tables import File, NoSuchNodeError
+from pytest import fixture, mark, raises, warns
 
 from battdat.data import BatteryDataset
 from battdat.io.batterydata import BDReader
 from battdat.postprocess.timing import CycleTimesSummarizer
+from battdat.schemas import BatteryMetadata
 from battdat.streaming import iterate_records_from_file, iterate_cycles_from_file
 from battdat.streaming.hdf5 import HDF5Writer
 
@@ -106,3 +108,96 @@ def test_streaming_write_existing_store(example_dataset, tmpdir):
     # Read it in
     data = BatteryDataset.from_hdf(out_file)
     assert np.allclose(data.raw_data['test_time'], [0., 1.])
+
+
+def test_streaming_write_many_rows(example_dataset, tmpdir):
+    out_file = Path(tmpdir) / 'streamed.h5'
+    expected = example_dataset.raw_data.iloc[:3]
+    rows = expected.to_dict(orient='records')
+
+    with HDF5Writer(out_file, metadata=example_dataset.metadata, buffer_size=3) as writer:
+        assert writer.write_row(rows[0]) == 0
+        assert writer.write_rows(rows[1:]) == 3
+
+    data = BatteryDataset.from_hdf(out_file)
+    assert len(data.raw_data) == len(expected)
+    columns = ['test_time', 'current', 'voltage']
+    assert np.allclose(data.raw_data[columns], expected[columns])
+
+
+def test_streaming_write_to_group_in_open_file(tmpdir):
+    out_file = Path(tmpdir) / 'streamed.h5'
+
+    with File(out_file, mode='a') as file:
+        file.create_group('/', 'cell_1')
+        with HDF5Writer(file, key='cell_1', buffer_size=2) as writer:
+            assert writer.write_rows([{'test_time': 0.}, {'test_time': 1.}]) == 2
+
+        assert '/raw_data' not in file
+        assert np.allclose(file.root.cell_1.raw_data.col('test_time'), [0., 1.])
+
+    with HDF5Writer(out_file, key='cell_1', buffer_size=2) as writer:
+        assert writer.write_row({'test_time': 2.}) == 0
+
+    data = BatteryDataset.from_hdf(out_file, prefix='cell_1')
+    assert np.allclose(data.raw_data['test_time'], [0., 1., 2.])
+
+
+def test_streaming_write_missing_group_closes_owned_file(tmpdir):
+    out_file = Path(tmpdir) / 'streamed.h5'
+    writer = HDF5Writer(out_file, key='missing')
+
+    with raises(NoSuchNodeError):
+        with writer:
+            pass
+
+    assert writer._file is None
+
+    with File(out_file, mode='a') as file:
+        writer = HDF5Writer(file, key='missing')
+        with raises(NoSuchNodeError):
+            with writer:
+                pass
+        assert file.isopen
+
+
+def test_streaming_writer_file_ownership_on_flush_failure(tmpdir):
+    out_file = Path(tmpdir) / 'streamed.h5'
+    with HDF5Writer(out_file, buffer_size=1) as writer:
+        writer.write_row({'test_time': 0.})
+
+    writer = HDF5Writer(out_file)
+    with raises(KeyError):
+        with writer:
+            writer.write_row({})
+    assert writer._file is None
+
+    with File(out_file, mode='a') as file:
+        writer = HDF5Writer(file)
+        with raises(KeyError):
+            with writer:
+                writer.write_row({})
+        assert file.isopen
+
+
+def test_streaming_writer_warns_on_conflicting_metadata(tmpdir):
+    out_file = Path(tmpdir) / 'streamed.h5'
+    first_metadata = BatteryMetadata(name='cell_1')
+    second_metadata = BatteryMetadata(name='cell_2')
+
+    with File(out_file, mode='a') as file:
+        file.create_group('/', 'cell_1')
+        file.create_group('/', 'cell_2')
+        file.root._v_attrs.metadata = first_metadata.model_dump_json()
+
+        with warnings.catch_warnings():
+            warnings.filterwarnings('error', message='Metadata already in HDF5 differs')
+            with HDF5Writer(file, key='cell_1', metadata=first_metadata) as writer:
+                writer.write_row({'test_time': 0.})
+
+        with warns(UserWarning, match='Metadata already in HDF5 differs'):
+            with HDF5Writer(file, key='cell_2', metadata=second_metadata) as writer:
+                writer.write_row({'test_time': 1.})
+
+        stored_metadata = BatteryMetadata.model_validate_json(file.root._v_attrs.metadata)
+        assert stored_metadata == second_metadata
